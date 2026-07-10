@@ -12,7 +12,7 @@ import os, glob, json, shutil
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv()  # Works locally; on Streamlit Cloud, secrets are set via the dashboard
 
 # ── LangChain / Google ────────────────────────────────────────────
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -37,7 +37,12 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 KB_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Config ────────────────────────────────────────────────────────
-GOOGLE_API_KEY  = os.getenv("GOOGLE_API_KEY", "")
+# Read from Streamlit Cloud secrets first, then fall back to local .env
+import streamlit as _st
+try:
+    GOOGLE_API_KEY = _st.secrets["GOOGLE_API_KEY"]
+except Exception:
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GEMINI_MODEL    = "gemini-2.5-flash"
 EMBEDDING_MODEL = "models/gemini-embedding-2"
 
