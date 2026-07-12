@@ -43,7 +43,11 @@ try:
     GOOGLE_API_KEY = _st.secrets["GOOGLE_API_KEY"]
 except Exception:
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-GEMINI_MODEL    = "gemini-2.0-flash"
+# Models tried in order — falls back if one hits a rate limit
+MODEL_WATERFALL = [
+    "gemini-3.1-flash-lite",      # 500 requests/day limit
+    "gemini-flash-lite-latest",   # Stable fallback
+]
 EMBEDDING_MODEL = "models/gemini-embedding-2"
 
 WELCOME_MSG     = "Hello! How can I help you today? Ask me anything about your documents."
@@ -195,42 +199,53 @@ def get_history_text(history: ChatMessageHistory) -> str:
     return "\n".join(lines)
 
 
-def _invoke_with_retry(llm, prompt, max_retries=3):
-    """Call LLM with auto-retry on rate limit (429) errors."""
+def _invoke_with_fallback(prompt):
+    """Try each model in the waterfall until one works. Handles rate limits gracefully."""
     import time
-    for attempt in range(max_retries):
-        try:
-            return llm.invoke(prompt)
-        except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                wait = 15 * (attempt + 1)  # 15s, 30s, 45s
-                time.sleep(wait)
-            else:
-                raise e
-    raise Exception(f"Model quota exceeded after {max_retries} retries. Please wait a minute and try again.")
+    last_error = None
+    for model_name in MODEL_WATERFALL:
+        llm = ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=GOOGLE_API_KEY,
+            temperature=0.3,
+        )
+        for attempt in range(2):  # 2 retries per model
+            try:
+                return llm.invoke(prompt)
+            except Exception as e:
+                last_error = e
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    if attempt == 0:
+                        time.sleep(10)  # short wait before retry
+                    # if second attempt also fails, move to next model
+                elif "NOT_FOUND" in str(e) or "404" in str(e):
+                    break  # model doesn't exist, skip immediately
+                else:
+                    raise e  # unknown error, raise immediately
+    raise Exception(
+        f"⚠️ All AI models are temporarily rate-limited on your free API key. "
+        f"Please wait 1-2 minutes and try again. "
+        f"Consider upgrading your Google AI API plan for unlimited access."
+    )
 
 
 def answer_question(question: str, history: ChatMessageHistory) -> tuple[str, list]:
     """Condense question → retrieve docs → answer. Returns (answer, source_docs)."""
-    llm = ChatGoogleGenerativeAI(
-        model=GEMINI_MODEL,
-        google_api_key=GOOGLE_API_KEY,
-        temperature=0.3,
-    )
-    condense_llm = ChatGoogleGenerativeAI(
-        model=GEMINI_MODEL,
-        google_api_key=GOOGLE_API_KEY,
-        temperature=0.0,
-    )
-
     history_text = get_history_text(history)
 
-    # Step 1 — condense to standalone question
+    # Step 1 — condense to standalone question (skip if no history)
     if history_text:
-        standalone = _invoke_with_retry(
-            condense_llm,
-            CONDENSE_PROMPT.format(history=history_text, question=question)
-        ).content.strip()
+        condense_llm = ChatGoogleGenerativeAI(
+            model=MODEL_WATERFALL[0],
+            google_api_key=GOOGLE_API_KEY,
+            temperature=0.0,
+        )
+        try:
+            standalone = _invoke_with_fallback(
+                CONDENSE_PROMPT.format(history=history_text, question=question)
+            ).content.strip()
+        except Exception:
+            standalone = question  # fallback: use raw question
     else:
         standalone = question
 
@@ -240,9 +255,8 @@ def answer_question(question: str, history: ChatMessageHistory) -> tuple[str, li
     docs = retriever.invoke(standalone)
     context = "\n\n".join(d.page_content for d in docs)
 
-    # Step 3 — generate answer
-    answer = _invoke_with_retry(
-        llm,
+    # Step 3 — generate answer using model waterfall
+    answer = _invoke_with_fallback(
         ANSWER_PROMPT.format(
             context=context,
             history=history_text,
