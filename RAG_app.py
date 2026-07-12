@@ -229,6 +229,24 @@ def _invoke_with_fallback(prompt):
     )
 
 
+def extract_text(msg) -> str:
+    """Safely extract text from AIMessage, as newer Gemini models return lists."""
+    if not msg:
+        return ""
+    content = msg.content
+    if isinstance(content, str):
+        return content.strip()
+    elif isinstance(content, list):
+        texts = []
+        for part in content:
+            if isinstance(part, dict) and "text" in part:
+                texts.append(part["text"])
+            elif isinstance(part, str):
+                texts.append(part)
+        return "".join(texts).strip()
+    return str(content).strip()
+
+
 def answer_question(question: str, history: ChatMessageHistory) -> tuple[str, list]:
     """Condense question → retrieve docs → answer. Returns (answer, source_docs)."""
     history_text = get_history_text(history)
@@ -241,9 +259,10 @@ def answer_question(question: str, history: ChatMessageHistory) -> tuple[str, li
             temperature=0.0,
         )
         try:
-            standalone = _invoke_with_fallback(
+            standalone_msg = _invoke_with_fallback(
                 CONDENSE_PROMPT.format(history=history_text, question=question)
-            ).content.strip()
+            )
+            standalone = extract_text(standalone_msg)
         except Exception:
             standalone = question  # fallback: use raw question
     else:
@@ -256,13 +275,14 @@ def answer_question(question: str, history: ChatMessageHistory) -> tuple[str, li
     context = "\n\n".join(d.page_content for d in docs)
 
     # Step 3 — generate answer using model waterfall
-    answer = _invoke_with_fallback(
+    answer_msg = _invoke_with_fallback(
         ANSWER_PROMPT.format(
             context=context,
             history=history_text,
             question=question,
         )
-    ).content.strip()
+    )
+    answer = extract_text(answer_msg)
 
     return answer, docs
 
