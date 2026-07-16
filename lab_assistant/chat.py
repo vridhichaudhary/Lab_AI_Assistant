@@ -4,7 +4,7 @@ chat.py — Natural language query handler for the IOCL Lab Assistant.
 Strategy:
   1. Fast rule-based extraction of date / shift / sample / parameter.
   2. Direct SQL query — no LLM tokens wasted for simple lookups.
-  3. LLM (Gemini via LangChain SQL Agent) only for complex or ambiguous queries.
+  3. LLM fallback only for complex or ambiguous queries.
 """
 import re
 from datetime import date, timedelta
@@ -84,13 +84,11 @@ def _extract_date(text: str) -> str | None:
 
 def _extract_parameter(text: str) -> str | None:
     """Detect if user is asking for a specific parameter only."""
-    # Common patterns: "what is Density", "PX value", "Sulfur of"
     m = re.search(
         r"\b(density|sulfur|iron|px|bz|tol|mx|ox|h2|c1|c2|ibp|fbp|chloride|reformate)\b",
         text, re.I
     )
     if m:
-        # Disambiguate: "reformate" is a sample, not a param
         word = m.group(1).lower()
         if word == "reformate":
             return None
@@ -99,12 +97,15 @@ def _extract_parameter(text: str) -> str | None:
 
 
 def _get_all_sample_names() -> list[str]:
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT DISTINCT sample_name FROM lab_results WHERE sample_name IS NOT NULL"
-    ).fetchall()
-    conn.close()
-    return [r[0] for r in rows]
+    try:
+        conn = get_conn()
+        rows = conn.execute(
+            "SELECT DISTINCT sample_name FROM lab_results WHERE sample_name IS NOT NULL"
+        ).fetchall()
+        conn.close()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
 
 
 def _fuzzy_sample_match(text: str) -> str | None:
@@ -133,11 +134,12 @@ def _fuzzy_sample_match(text: str) -> str | None:
 # ── Result formatter ──────────────────────────────────────────────────────────
 
 def _format_results(rows: list[dict]) -> str:
+    """Format DB rows into a beautiful Markdown response."""
     if not rows:
-        return "❌ No matching laboratory record was found."
+        return "No matching laboratory record was found."
 
-    # Group: date → shift → sample → [(param, val)]
     from collections import defaultdict
+    # Group: date -> shift -> sample -> [(param, val)]
     grouped: dict = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
     for r in rows:
@@ -148,12 +150,20 @@ def _format_results(rows: list[dict]) -> str:
     lines = []
     for rdate, shifts in sorted(grouped.items(), reverse=True):
         for shift, samples in sorted(shifts.items()):
-            shift_label = "Morning Shift" if shift == "M" else "Evening Shift"
-            lines.append(f"**📅 Date: {rdate} | {shift_label}**\n")
+            shift_label = "Morning Shift" if shift == "M" else "Evening Shift" if shift == "E" else shift
+            
+            lines.append(f"### 📅 {rdate} | {shift_label}")
+            lines.append("")
+            
             for sample, params in sorted(samples.items()):
-                lines.append(f"📋 **Sample: {sample}**")
+                lines.append(f"**Sample:** `{sample}`")
+                lines.append("")
+                lines.append("| Parameter | Value |")
+                lines.append("|---|---|")
                 for pname, pval in params:
-                    lines.append(f"  • {pname} : {pval}")
+                    lines.append(f"| {pname} | {pval} |")
+                lines.append("")
+                lines.append("---")
                 lines.append("")
 
     return "\n".join(lines).strip()
@@ -176,11 +186,10 @@ def _llm_answer(question: str, api_key: str, model: str) -> str:
     PREFIX = (
         f"Today's date is {today_str}. "
         "You are an IOCL laboratory assistant. "
-        "Answer only from the lab_results and reports tables. "
+        "Answer only from the lab_results table. "
         "The 'shift' column contains 'M' for Morning and 'E' for Evening. "
         "NEVER return rows where parameter_value is empty (they are never stored empty). "
-        "Format the final answer grouped by date, shift, sample. "
-        "If nothing matches, say 'No matching laboratory record was found.'"
+        "Format the final answer using Markdown tables grouped by date, shift, and sample."
     )
 
     agent = create_sql_agent(llm, db=db, verbose=False, prefix=PREFIX)
@@ -188,7 +197,7 @@ def _llm_answer(question: str, api_key: str, model: str) -> str:
         res = agent.invoke({"input": question})
         return res.get("output", "No matching laboratory record was found.")
     except Exception as e:
-        return f"⚠️ Could not complete query: {str(e)}"
+        return f"Could not complete query: {str(e)}"
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -214,7 +223,6 @@ def answer(question: str, api_key: str, model: str) -> str:
         )
         if rows:
             return _format_results(rows)
-        # Nothing found — still fall through to LLM so it can clarify
 
     # LLM fallback
     return _llm_answer(question, api_key, model)

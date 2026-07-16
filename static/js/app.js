@@ -174,8 +174,8 @@ function appendMessage(role, text) {
   avatar.innerHTML = role === 'user' ? '<i data-feather="user"></i>' : '<i data-feather="database"></i>';
 
   const bubble = document.createElement('div');
-  bubble.className = 'message-bubble';
-  bubble.textContent = text;
+  bubble.className = 'message-bubble markdown-body';
+  bubble.innerHTML = (role === 'assistant' && typeof marked !== 'undefined') ? marked.parse(text) : escapeHtml(text);
 
   div.appendChild(avatar);
   div.appendChild(bubble);
@@ -293,7 +293,9 @@ function renderHistory(filter = '') {
         <span class="history-q-text">${escapeHtml(h.question)}</span>
         <span class="history-ts">${h.ts}</span>
       </div>
-      <div class="history-answer" id="hist-ans-${i}">${escapeHtml(h.answer)}</div>
+      <div class="history-answer markdown-body" id="hist-ans-${i}">
+        ${typeof marked !== 'undefined' ? marked.parse(h.answer) : escapeHtml(h.answer)}
+      </div>
     </div>
   `).join('');
   feather.replace();

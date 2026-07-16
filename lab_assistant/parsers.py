@@ -4,7 +4,7 @@ parsers.py — File parsers for HTML, Excel/CSV, and PDF lab report files.
 Rules:
 - Dynamic column detection (no hardcoded parameter names).
 - Blank/null values are NEVER stored.
-- Each non-empty cell → one {sample_name, parameter_name, parameter_value} record.
+- Each non-empty cell → one {report_date, shift, sample_name, parameter_name, parameter_value} record.
 """
 import re
 import io
@@ -16,53 +16,129 @@ from bs4 import BeautifulSoup
 
 # ── Utility ───────────────────────────────────────────────────────────────────
 
-_BLANK = {"", "nan", "none", "-", "--", "n/a", "na", "#n/a", "nil"}
+_BLANK = {"", "nan", "none", "-", "--", "n/a", "na", "#n/a", "nil", "unnamed"}
 
 def _clean(v) -> str | None:
     """Return None if blank, else return string value."""
-    if v is None:
+    if pd.isna(v) or v is None:
         return None
     s = str(v).strip()
-    if s.lower() in _BLANK:
+    if not s or s.lower() in _BLANK or s.lower().startswith("unnamed:"):
         return None
     return s
 
 
-def _df_to_rows(df: pd.DataFrame) -> list[dict]:
+def _format_date(raw_date: str, fallback: str | None) -> str | None:
+    if not raw_date:
+        return fallback
+    # dd.mm.yyyy or dd/mm/yyyy
+    m = re.search(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})", raw_date)
+    if m:
+        dd, mm, yyyy = m.groups()
+        return f"{yyyy}-{mm.zfill(2)}-{dd.zfill(2)}"
+    # yyyy-mm-dd
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", raw_date)
+    if m:
+        return m.group(0)
+    return fallback
+
+
+def _format_shift(raw_shift: str, fallback: str | None) -> str | None:
+    if not raw_shift:
+        return fallback
+    s = raw_shift.strip().upper()
+    if s in ("M", "MORNING"):
+        return "M"
+    if s in ("E", "EVENING"):
+        return "E"
+    return fallback
+
+
+def _df_to_rows(df: pd.DataFrame, default_date: str | None, default_shift: str | None) -> list[dict]:
     """
     Convert a DataFrame to a list of lab result rows.
-    Assumption: column[0] is Sample Name; rest are parameter columns.
-    Only non-empty values are emitted.
+    Dynamically finds the header row containing "SAMPLE" and extracts
+    row-level Date and Shift if present.
     """
     df = df.dropna(how="all").dropna(axis=1, how="all")
     if df.empty or df.shape[1] < 2:
         return []
 
-    # Flatten MultiIndex columns
+    # Flatten MultiIndex columns if present
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [" ".join(str(c) for c in col if str(c) != "nan").strip()
-                      for col in df.columns]
+        df.columns = [" ".join(str(c) for c in col if str(c) != "nan").strip() for col in df.columns]
+    
+    # 1. Find the actual header row
+    header_idx = -1
+    for i, row in df.iterrows():
+        # Check if this row contains 'SAMPLE' in any cell
+        for cell in row:
+            if isinstance(cell, str) and "SAMPLE" in cell.upper():
+                header_idx = i
+                break
+        if header_idx != -1:
+            break
 
-    # Ensure string columns
+    if header_idx != -1:
+        # We found a header row inside the data!
+        new_header = df.iloc[header_idx]
+        df = df.iloc[header_idx + 1:]
+        df.columns = new_header
+        
     df.columns = [str(c).strip() for c in df.columns]
 
-    sample_col = df.columns[0]
-    param_cols = df.columns[1:]
+    # 2. Identify core columns
+    cols_upper = [c.upper() for c in df.columns]
+    
+    sample_col_idx = -1
+    date_col_idx = -1
+    shift_col_idx = -1
+    
+    for i, c in enumerate(cols_upper):
+        if "SAMPLE" in c and sample_col_idx == -1:
+            sample_col_idx = i
+        elif "DATE" in c and date_col_idx == -1:
+            date_col_idx = i
+        elif "SHIFT" in c and shift_col_idx == -1:
+            shift_col_idx = i
+            
+    if sample_col_idx == -1:
+        # Fallback: assume first column is sample
+        sample_col_idx = 0
 
+    sample_col_name = df.columns[sample_col_idx]
+    
     rows = []
     for _, row in df.iterrows():
-        sample = _clean(row[sample_col])
+        sample = _clean(row[sample_col_name])
         if not sample:
             continue
 
-        for param in param_cols:
-            val = _clean(row[param])
+        # Extract row-level Date and Shift if columns exist
+        r_date = default_date
+        r_shift = default_shift
+        
+        if date_col_idx != -1:
+            r_date = _format_date(_clean(row[df.columns[date_col_idx]]) or "", default_date)
+        if shift_col_idx != -1:
+            r_shift = _format_shift(_clean(row[df.columns[shift_col_idx]]) or "", default_shift)
+
+        # Iterate over all other columns (parameters)
+        for i, col_name in enumerate(df.columns):
+            if i in (sample_col_idx, date_col_idx, shift_col_idx):
+                continue
+                
+            val = _clean(row[col_name])
             if val is None:
                 continue
-            param_name = str(param).strip()
-            if not param_name or param_name.lower() in _BLANK:
+                
+            param_name = str(col_name).strip()
+            if not param_name or param_name.lower() in _BLANK or param_name.isnumeric():
                 continue
+                
             rows.append({
+                "report_date":     r_date or "Unknown",
+                "shift":           r_shift or "Unknown",
                 "sample_name":     sample,
                 "parameter_name":  param_name,
                 "parameter_value": val,
@@ -101,10 +177,10 @@ def detect_metadata(file_name: str, content_text: str = "") -> dict:
 
 # ── Parsers ───────────────────────────────────────────────────────────────────
 
-def parse_html(file_bytes: bytes) -> tuple[list[dict], dict]:
+def parse_html(file_bytes: bytes, file_name: str) -> tuple[list[dict], dict]:
     """Parse .html / .htm lab report. Returns (rows, detected_metadata)."""
     text = file_bytes.decode("utf-8", errors="ignore")
-    meta = detect_metadata("", text)
+    meta = detect_metadata(file_name, text)
 
     rows = []
     try:
@@ -113,7 +189,7 @@ def parse_html(file_bytes: bytes) -> tuple[list[dict], dict]:
         tables = []
 
     for df in tables:
-        rows.extend(_df_to_rows(df))
+        rows.extend(_df_to_rows(df, meta.get("report_date"), meta.get("shift")))
 
     return rows, meta
 
@@ -124,9 +200,9 @@ def parse_excel(file_bytes: bytes, file_name: str) -> tuple[list[dict], dict]:
 
     rows = []
     try:
-        xls = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=0)
+        xls = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None)
         for _sheet, df in xls.items():
-            rows.extend(_df_to_rows(df))
+            rows.extend(_df_to_rows(df, meta.get("report_date"), meta.get("shift")))
     except Exception:
         pass
 
@@ -138,8 +214,8 @@ def parse_csv(file_bytes: bytes, file_name: str) -> tuple[list[dict], dict]:
     meta = detect_metadata(file_name)
     rows = []
     try:
-        df = pd.read_csv(io.BytesIO(file_bytes))
-        rows.extend(_df_to_rows(df))
+        df = pd.read_csv(io.BytesIO(file_bytes), header=None)
+        rows.extend(_df_to_rows(df, meta.get("report_date"), meta.get("shift")))
     except Exception:
         pass
     return rows, meta
@@ -159,24 +235,9 @@ def parse_pdf(file_bytes: bytes, file_name: str) -> tuple[list[dict], dict]:
             for table in (page.extract_tables() or []):
                 if not table or len(table) < 2:
                     continue
-                headers = [str(h).strip() if h else "" for h in table[0]]
-                for row_data in table[1:]:
-                    sample = _clean(row_data[0]) if row_data else None
-                    if not sample:
-                        continue
-                    for idx, param in enumerate(headers[1:], 1):
-                        if idx >= len(row_data):
-                            continue
-                        val = _clean(row_data[idx])
-                        if val is None or not param.strip():
-                            continue
-                        rows.append({
-                            "sample_name":     sample,
-                            "parameter_name":  param.strip(),
-                            "parameter_value": val,
-                        })
+                df = pd.DataFrame(table)
+                rows.extend(_df_to_rows(df, meta.get("report_date"), meta.get("shift")))
 
-    # refine metadata from text
     if not meta["shift"] or not meta["report_date"]:
         extra = detect_metadata(file_name, content_text)
         meta["shift"] = meta["shift"] or extra["shift"]
@@ -187,12 +248,11 @@ def parse_pdf(file_bytes: bytes, file_name: str) -> tuple[list[dict], dict]:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def parse_file(file_bytes: bytes,
-               file_name: str) -> tuple[list[dict], dict]:
+def parse_file(file_bytes: bytes, file_name: str) -> tuple[list[dict], dict]:
     """Route file to correct parser. Returns (rows, detected_metadata)."""
     ext = Path(file_name).suffix.lower().lstrip(".")
     if ext in ("html", "htm"):
-        return parse_html(file_bytes)
+        return parse_html(file_bytes, file_name)
     elif ext in ("xlsx", "xls"):
         return parse_excel(file_bytes, file_name)
     elif ext == "csv":

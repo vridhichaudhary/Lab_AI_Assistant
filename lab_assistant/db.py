@@ -36,6 +36,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS lab_results (
             result_id        INTEGER PRIMARY KEY AUTOINCREMENT,
             report_id        TEXT    NOT NULL,
+            report_date      TEXT    NOT NULL,
+            shift            TEXT    NOT NULL,
             sample_name      TEXT,
             parameter_name   TEXT    NOT NULL,
             parameter_value  TEXT    NOT NULL,
@@ -45,7 +47,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_lr_report    ON lab_results(report_id);
         CREATE INDEX IF NOT EXISTS idx_lr_sample    ON lab_results(sample_name);
         CREATE INDEX IF NOT EXISTS idx_lr_param     ON lab_results(parameter_name);
-        CREATE INDEX IF NOT EXISTS idx_r_date_shift ON reports(report_date, shift);
+        CREATE INDEX IF NOT EXISTS idx_r_date_shift ON lab_results(report_date, shift);
     """)
     conn.commit()
     conn.close()
@@ -76,15 +78,16 @@ def insert_report(report_date: str, shift: str, uploaded_by: str,
 def insert_lab_results(report_id: str, rows: list[dict]):
     """
     Bulk-insert parsed lab result rows.
-    Each row: {sample_name, parameter_name, parameter_value}
+    Each row: {report_date, shift, sample_name, parameter_name, parameter_value}
     Blank values must be filtered BEFORE calling this.
     """
     if not rows:
         return
     conn = get_conn()
     conn.executemany(
-        """INSERT INTO lab_results (report_id, sample_name, parameter_name, parameter_value)
-           VALUES (:report_id, :sample_name, :parameter_name, :parameter_value)""",
+        """INSERT INTO lab_results 
+           (report_id, report_date, shift, sample_name, parameter_name, parameter_value)
+           VALUES (:report_id, :report_date, :shift, :sample_name, :parameter_name, :parameter_value)""",
         [{"report_id": report_id, **r} for r in rows]
     )
     conn.commit()
@@ -130,18 +133,17 @@ def query_results(report_date: str | None = None,
     """
     conn = get_conn()
     sql = """
-        SELECT r.report_date, r.shift, lr.sample_name,
+        SELECT lr.report_date, lr.shift, lr.sample_name,
                lr.parameter_name, lr.parameter_value
         FROM   lab_results lr
-        JOIN   reports r ON lr.report_id = r.report_id
         WHERE  1=1
     """
     params: list = []
     if report_date:
-        sql += " AND r.report_date = ?"
+        sql += " AND lr.report_date = ?"
         params.append(report_date)
     if shift:
-        sql += " AND UPPER(r.shift) = ?"
+        sql += " AND UPPER(lr.shift) = ?"
         params.append(shift.upper())
     if sample_filter:
         sql += " AND LOWER(lr.sample_name) LIKE ?"
@@ -149,7 +151,7 @@ def query_results(report_date: str | None = None,
     if parameter_filter:
         sql += " AND LOWER(lr.parameter_name) LIKE ?"
         params.append(f"%{parameter_filter.lower()}%")
-    sql += " ORDER BY r.report_date DESC, r.shift, lr.sample_name, lr.parameter_name"
+    sql += " ORDER BY lr.report_date DESC, lr.shift, lr.sample_name, lr.parameter_name"
 
     rows = conn.execute(sql, params).fetchall()
     conn.close()
