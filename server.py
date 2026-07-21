@@ -1,6 +1,14 @@
 """
 server.py — Flask backend for the IOCL Laboratory Results Assistant.
 Serves the HTML frontend and exposes REST API endpoints.
+
+Ingestion paths:
+  • .htm/.html  → lab_parser (structured nobr-cell extraction) → lab_ingest (SQLite)
+  • other types → lab_assistant.parsers (generic pandas-based) → lab_assistant.db
+
+Query routing:
+  1. lab_query (exact structured lookup, zero LLM tokens) — if a known sample matches
+  2. lab_assistant.chat / LLM fallback — for everything else
 """
 import os
 from pathlib import Path
@@ -15,6 +23,14 @@ from lab_assistant.db import (init_db, run_cleanup, get_all_reports,
                                insert_lab_results, get_conn)
 from lab_assistant.parsers import parse_file
 from lab_assistant.chat import answer as lab_answer
+
+# ── New structured lab pipeline ───────────────────────────────────────────────
+from lab_ingest import ingest_lab_reports, load_records_from_db, init_lab_table
+from lab_query import query_records, format_records_as_tables
+
+LAB_DB_PATH = Path("data/lab_results_structured.db")
+LAB_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+init_lab_table(LAB_DB_PATH)
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
@@ -81,13 +97,52 @@ def api_upload():
     if not file or not file.filename:
         return jsonify({"error": "No file provided"}), 400
 
+    ext = Path(file.filename).suffix.lower()
+
+    # ── HTM / HTML → new structured parser ───────────────────────────────────
+    if ext in (".htm", ".html"):
+        try:
+            import tempfile, os as _os
+            file_bytes = file.read()
+            safe_name = "".join(c if c.isalnum() or c in "._-" else "_"
+                                for c in file.filename)
+            tmp_path = UPLOADS_DIR / safe_name
+            tmp_path.write_bytes(file_bytes)
+
+            summary = ingest_lab_reports([tmp_path], LAB_DB_PATH)
+            num_rows  = summary["num_rows_parsed"]
+            num_vals  = summary["num_parameter_values_inserted"]
+            shifts    = list({r.shift for r in load_records_from_db(LAB_DB_PATH)
+                              if r.source_file == safe_name}) or ["M/E/N"]
+            dates     = summary["date_range"]
+
+            if num_rows == 0:
+                return jsonify({
+                    "error": "No data rows extracted. "
+                             "Please verify this is a valid PX/PTA lab report."
+                }), 400
+
+            return jsonify({
+                "success":           True,
+                "report_id":         safe_name,
+                "records_extracted": num_vals,
+                "detected_date":     dates[0] if dates else report_date_str,
+                "detected_shift":    "/".join(shifts),
+                "file_name":         file.filename,
+                "parser":            "structured-htm",
+                "unique_samples":    summary["unique_samples"],
+            })
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return jsonify({"error": f"Failed to parse HTM file: {e}"}), 500
+
+    # ── Other types → generic pandas parser → lab_assistant DB ───────────────
     try:
         file_bytes = file.read()
         rows, meta = parse_file(file_bytes, file.filename)
     except Exception as e:
         return jsonify({"error": f"Failed to parse file: {e}"}), 500
 
-    # Shift is auto-detected from the document — never asked from user
     report_date = meta.get("report_date") or report_date_str
     shift       = meta.get("shift") or "Unknown"
 
@@ -97,7 +152,6 @@ def api_upload():
                      "Please verify the file contains a data table."
         }), 400
 
-    # Persist original file
     safe_name = "".join(c if c.isalnum() or c in "._-" else "_"
                         for c in file.filename)
     file_path = UPLOADS_DIR / f"{report_date}_{shift}_{safe_name}"
@@ -113,13 +167,14 @@ def api_upload():
     insert_lab_results(report_id, rows)
 
     return jsonify({
-        "success":          True,
-        "report_id":        report_id,
+        "success":           True,
+        "report_id":         report_id,
         "records_extracted": len(rows),
-        "detected_date":    report_date,
-        "detected_shift":   "Evening" if shift == "E" else
-                            "Morning" if shift == "M" else shift,
-        "file_name":        file.filename,
+        "detected_date":     report_date,
+        "detected_shift":    "Evening" if shift == "E" else
+                             "Morning" if shift == "M" else shift,
+        "file_name":         file.filename,
+        "parser":            "generic",
     })
 
 
@@ -131,6 +186,24 @@ def api_chat():
     if not question:
         return jsonify({"error": "No question provided"}), 400
 
+    # ── Route 1: Structured lab_query (zero LLM, exact precision) ────────────
+    # Load all structured records from the HTM parser DB and check if
+    # the question mentions any known sample name.
+    try:
+        lab_records = load_records_from_db(LAB_DB_PATH)
+        if lab_records:
+            known_samples = {r.sample for r in lab_records}
+            q_low = question.lower()
+            if any(s.lower() in q_low for s in known_samples):
+                results, parsed, warnings = query_records(question, lab_records)
+                if results:
+                    return jsonify({"response": format_records_as_tables(results)})
+                if warnings:
+                    return jsonify({"response": "\n".join(warnings)})
+    except Exception:
+        pass  # if structured path fails, fall through to LLM
+
+    # ── Route 2: LLM fallback for generic / non-sample questions ─────────────
     if not GOOGLE_API_KEY:
         return jsonify({"error": "Google API key not configured on the server."}), 500
 
