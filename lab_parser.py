@@ -115,13 +115,20 @@ def _extract_cells(filepath: str | Path) -> list[str]:
     """Read every <nobr> cell from the report, in document order, with
     non-breaking spaces normalized to regular spaces and whitespace trimmed.
     Mid-table page-break boilerplate is stripped so column alignment stays
-    correct across page boundaries.
+    correct across page boundaries. Standalone '|' divider artifacts (a
+    rare rendering quirk where the report interleaves a literal pipe
+    character between every value in a row, or renders a whole decorative
+    divider "row" of pipes) are also dropped entirely - a bare '|' is never
+    real report data, and removing it restores correct column alignment
+    for the handful of rows affected.
     """
     with open(filepath, encoding="utf-8", errors="ignore") as f:
         soup = BeautifulSoup(f.read(), "lxml")
     nobrs = soup.find_all("nobr")
     cells = [n.get_text().replace(NBSP, " ").strip() for n in nobrs]
-    return _strip_page_break_boilerplate(cells)
+    cells = _strip_page_break_boilerplate(cells)
+    cells = [c for c in cells if c != "|"]
+    return cells
 
 
 def parse_lab_report(filepath: str | Path) -> list[LabRecord]:
@@ -165,40 +172,49 @@ def parse_lab_report(filepath: str | Path) -> list[LabRecord]:
         units = cells[header_start + row_len : header_start + 2 * row_len]
         data_start = header_start + 2 * row_len
 
-        # Data rows are NOT always exactly row_len cells long: some rows
-        # omit trailing blank cells (columns with nothing reported at the
-        # very end of the row simply have no <nobr> tag at all in the
-        # source HTML). Advancing by a fixed row_len would silently drift
-        # out of alignment the first time this happens. Instead, find each
-        # row's actual boundary by locating the next row's DATE cell
-        # (always immediately after the next SAMPLE cell) and using that
-        # to determine where the current row ends.
-        row_starts = [data_start]
-        search_from = data_start + 2  # skip this row's own SAMPLE/DATE
-        while True:
-            next_date_idx = None
-            for i in range(search_from, section_end):
-                if DATE_RE.match(cells[i]):
-                    next_date_idx = i
-                    break
-            if next_date_idx is None:
-                break
-            next_row_start = next_date_idx - 1
-            row_starts.append(next_row_start)
-            search_from = next_row_start + 2
+        # Row detection is anchored on the SHIFT column, not the DATE
+        # column. This matters because a single sample+date can print
+        # THREE consecutive rows - one per shift (M, E, N) - where only
+        # the FIRST of the three carries the sample name and date; the
+        # other two have blank SAMPLE/DATE cells (they're visually
+        # "continuation" rows under the same sample/date in the source
+        # report) but always carry their own shift letter. The SHIFT cell
+        # is therefore the only column guaranteed to be a fixed, non-blank,
+        # closed-set value ('M', 'E', or 'N') for every real data row, so
+        # it's a far more reliable anchor than DATE (blank on continuation
+        # rows) or a fixed row length (some rows omit trailing blank cells
+        # entirely, which silently breaks fixed-length stepping).
+        shift_idxs = [
+            i for i in range(data_start, section_end) if cells[i] in ("M", "E", "N")
+        ]
 
-        row_bounds = list(zip(row_starts, row_starts[1:] + [section_end]))
+        last_sample, last_date = "", ""
+        for idx_pos, shift_idx in enumerate(shift_idxs):
+            sample = cells[shift_idx - 2] if shift_idx - 2 >= data_start else ""
+            date = cells[shift_idx - 1] if shift_idx - 1 >= data_start else ""
+            shift = cells[shift_idx]
 
-        for row_start, row_end in row_bounds:
-            row = cells[row_start:row_end]
-            if len(row) < 3:
-                continue
-            sample, date, shift = row[0], row[1], row[2]
-            if not sample or not re.search(r"[A-Za-z0-9]", sample):
-                continue  # skip stray blank/decoration rows (e.g. '|' borders)
+            if sample:
+                if not re.search(r"[A-Za-z]", sample):
+                    # Doesn't look like a real sample name (e.g. stray
+                    # numeric/decoration artifact) - treat as continuation
+                    # of the previous row instead of trusting it blindly.
+                    sample, date = last_sample, last_date
+                else:
+                    last_sample, last_date = sample, date or last_date
+            elif not last_sample:
+                continue  # stray shift-like token before any real row; skip
+            else:
+                sample, date = last_sample, last_date
+
+            row_values_start = shift_idx + 1
+            row_values_end = (
+                shift_idxs[idx_pos + 1] - 2 if idx_pos + 1 < len(shift_idxs) else section_end
+            )
+            row_values = cells[row_values_start:row_values_end]
 
             values: dict[str, tuple[str, str]] = {}
-            for h, u, v in zip(header[3:], units[3:], row[3:]):
+            for h, u, v in zip(header[3:], units[3:], row_values):
                 if h and v:  # only keep parameters that were actually reported
                     values[h] = (u, v)
 
