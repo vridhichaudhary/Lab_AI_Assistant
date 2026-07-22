@@ -382,6 +382,7 @@ async function loadStructuredReports() {
               <th>Records</th>
               <th>Uploaded</th>
               <th>Expires In</th>
+              <th style="width:50px;"></th>
             </tr>
           </thead>
           <tbody>
@@ -401,6 +402,11 @@ async function loadStructuredReports() {
                 <td>${r.record_count ?? '—'}</td>
                 <td>${uploaded.toLocaleDateString('en-GB', {day:'2-digit',month:'short',year:'numeric'})}</td>
                 <td style="${expClass};font-weight:600;">${daysLeft > 0 ? daysLeft + 'd' : 'Expired'}</td>
+                <td>
+                  <button class="btn btn-ghost" style="padding:4px;color:var(--error);" onclick="deleteStructuredReport('${escapeHtml(r.source_file)}')">
+                    <i data-feather="trash-2"></i>
+                  </button>
+                </td>
               </tr>`;
             }).join('')}
           </tbody>
@@ -409,6 +415,21 @@ async function loadStructuredReports() {
     feather.replace();
   } catch (e) {
     el.innerHTML = `<div class="empty-state"><p>Failed to load reports.</p></div>`;
+  }
+}
+
+async function deleteStructuredReport(fileName) {
+  if (!confirm(`Are you sure you want to delete ${fileName}?`)) return;
+  try {
+    const res = await fetch(`/api/structured-reports/${encodeURIComponent(fileName)}`, { method: 'DELETE' });
+    if (res.ok) {
+      showToast('Report deleted successfully');
+      loadStructuredReports();
+    } else {
+      showToast('Failed to delete report');
+    }
+  } catch (e) {
+    showToast('Error deleting report');
   }
 }
 

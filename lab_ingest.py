@@ -104,6 +104,35 @@ def cleanup_structured_reports(db_path=None, uploads_dir=None) -> int:
     return len(expired)
 
 
+def delete_structured_report(source_file: str):
+    """Manually delete a specific structured report from DB and Supabase Storage."""
+    conn = _get_conn()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT storage_path FROM structured_reports WHERE source_file = %s",
+        (source_file,)
+    )
+    row = cur.fetchone()
+    
+    if row:
+        sp = row.get("storage_path")
+        if sp:
+            try:
+                sb = _get_supabase()
+                sb.storage.from_(STORAGE_BUCKET).remove([sp])
+            except Exception as e:
+                print(f"[warn] Failed to delete from Supabase: {e}")
+                
+        cur.execute(
+            "DELETE FROM structured_reports WHERE source_file=%s",
+            (source_file,)
+        )
+        conn.commit()
+        
+    cur.close()
+    conn.close()
+
+
 def load_records_into_db(records: list[LabRecord], db_path=None,
                          file_bytes: bytes | None = None,
                          source_filename: str = "") -> int:

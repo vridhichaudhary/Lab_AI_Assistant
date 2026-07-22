@@ -29,7 +29,8 @@ from supabase import create_client
 
 # ── New structured lab pipeline ───────────────────────────────────────────────
 from lab_ingest import (ingest_lab_reports, load_records_from_db, init_lab_table,
-                        cleanup_structured_reports, get_all_structured_reports)
+                        cleanup_structured_reports, get_all_structured_reports,
+                        delete_structured_report)
 from lab_query import query_records, format_records_as_tables
 
 SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
@@ -102,6 +103,12 @@ def api_delete_report(report_id):
 def api_structured_reports():
     """Returns all stored HTM lab reports with date ranges and expiry info."""
     return jsonify(get_all_structured_reports())
+
+
+@app.route("/api/structured-reports/<path:report_id>", methods=["DELETE"])
+def api_delete_structured_report(report_id):
+    delete_structured_report(report_id)
+    return jsonify({"success": True})
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -254,7 +261,8 @@ def api_chat():
             err = str(e)
             if "429" in err or "RESOURCE_EXHAUSTED" in err:
                 continue
-            return jsonify({"error": err}), 500
+            import traceback
+            return jsonify({"error": err, "traceback": traceback.format_exc()}), 500
 
     return jsonify({
         "error": "All AI models are temporarily rate-limited. "
